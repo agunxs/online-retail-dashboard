@@ -59,6 +59,15 @@ def load_model():
         return payload['model'], payload['features']
     return None, None
 
+@st.cache_resource
+def load_product_stats(_df_sales):
+    # Pembeli tiap produk (pelanggan terdaftar) untuk menjelaskan skor CF,
+    # dan jumlah invoice tiap produk untuk memilih produk default
+    reg = _df_sales[_df_sales['CustomerID'].notna()]
+    buyers = reg.groupby('Description')['CustomerID'].agg(lambda s: frozenset(s.unique())).to_dict()
+    invoices = _df_sales.groupby('Description')['InvoiceNo'].nunique()
+    return buyers, invoices
+
 # Memuat semua aset
 df_sales, df_rfm, df_rules, df_rec_prod, df_rec_cust, df_churn, df_forecast = load_data()
 model_churn, model_features = load_model()
@@ -140,6 +149,11 @@ if page == "📈 Ringkasan Penjualan":
             )
             fig_prod.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_prod, width="stretch")
+            # Catatan kualitas data: satu order besar yang kemudian dibatalkan lewat koreksi manual
+            if ('PICNIC BASKET WICKER SMALL' in top_products['Description'].values
+                    and (filtered_sales['InvoiceNo'].astype(str) == '556444').any()):
+                st.caption("Catatan data: PICNIC BASKET WICKER SMALL masuk 10 besar karena satu invoice (556444, £38,970) "
+                           "yang kemudian dibatalkan lewat koreksi manual. Tanpa invoice itu, produk ini tidak masuk 10 besar.")
 
         # Konsentrasi Penjualan per Negara
         st.subheader("🌍 Konsentrasi Penjualan per Negara")
@@ -227,26 +241,57 @@ elif page == "👥 Segmen Pelanggan (RFM)":
     if df_rfm.empty:
         st.warning("Data segmen RFM tidak ditemukan.")
     else:
+        # Profil segmen, dihitung dari rfm_segments.csv
+        seg_profile = df_rfm.groupby('Segment').agg(
+            Pelanggan=('CustomerID', 'count'),
+            Total_Rev=('Monetary', 'sum'),
+            Rata_Belanja=('Monetary', 'mean'),
+            Median_Recency=('Recency', 'median'),
+            Median_Frequency=('Frequency', 'median'),
+            Median_Monetary=('Monetary', 'median'),
+            Sekali_Belanja=('Frequency', lambda f: (f == 1).mean() * 100)
+        ).reset_index()
+        seg_profile['Persen_Pelanggan'] = seg_profile['Pelanggan'] / seg_profile['Pelanggan'].sum() * 100
+        seg_profile['Persen_Revenue'] = seg_profile['Total_Rev'] / seg_profile['Total_Rev'].sum() * 100
+        seg_profile = seg_profile.sort_values(by='Total_Rev', ascending=False)
+
+        st.subheader("📊 Profil Karakteristik Segmen Pelanggan")
+        st.dataframe(
+            seg_profile, hide_index=True, width="stretch",
+            column_order=['Segment', 'Pelanggan', 'Persen_Pelanggan', 'Persen_Revenue', 'Total_Rev', 'Rata_Belanja',
+                          'Median_Recency', 'Median_Frequency', 'Median_Monetary', 'Sekali_Belanja'],
+            column_config={
+                'Segment': st.column_config.TextColumn('Segmen'),
+                'Pelanggan': st.column_config.NumberColumn('Pelanggan', format='%,d'),
+                'Persen_Pelanggan': st.column_config.NumberColumn('% Pelanggan', format='%.2f%%'),
+                'Persen_Revenue': st.column_config.NumberColumn('% Revenue', format='%.2f%%'),
+                'Total_Rev': st.column_config.NumberColumn('Total Belanja (£)', format='%,.2f'),
+                'Rata_Belanja': st.column_config.NumberColumn('Rata-rata Belanja (£)', format='%,.2f'),
+                'Median_Recency': st.column_config.NumberColumn('Median Recency (hari)', format='%.0f'),
+                'Median_Frequency': st.column_config.NumberColumn('Median Frequency', format='%.0f'),
+                'Median_Monetary': st.column_config.NumberColumn('Median Monetary (£)', format='%,.2f'),
+                'Sekali_Belanja': st.column_config.NumberColumn('% Sekali Belanja', format='%.1f%%',
+                    help='Persentase pelanggan di segmen ini yang baru bertransaksi satu kali'),
+            }
+        )
+        st.caption("% Revenue dihitung terhadap total belanja pelanggan terdaftar, bukan terhadap total pendapatan di halaman Ringkasan.")
+
+        # Sorotan otomatis dari data
+        top_seg = seg_profile.iloc[0]
+        sorotan = [f"**{top_seg['Segment']}** hanya {top_seg['Persen_Pelanggan']:.2f}% pelanggan, tetapi menyumbang "
+                   f"{top_seg['Persen_Revenue']:.2f}% total belanja."]
+        loyal = df_rfm[df_rfm['Segment'] == 'Loyal']
+        if not loyal.empty:
+            loyal_jauh = loyal[loyal['Recency'] > 90]
+            sorotan.append(f"**{len(loyal_jauh):,} pelanggan Loyal** ({len(loyal_jauh) / len(loyal) * 100:.1f}%) sudah lebih dari "
+                           f"90 hari tidak belanja, dengan total belanja £{loyal_jauh['Monetary'].sum():,.0f}. "
+                           "Mereka target utama kampanye retensi.")
+        st.markdown("**Sorotan:**\n" + "\n".join(f"- {teks}" for teks in sorotan))
+
         col1, col2 = st.columns([1, 2])
 
         with col1:
-            st.subheader("📊 Profil Karakteristik Segmen Pelanggan")
-            # Hitung agregat profil segmen
-            seg_profile = df_rfm.groupby('Segment').agg(
-                Pelanggan=('CustomerID', 'count'),
-                Median_Recency=('Recency', 'median'),
-                Median_Frequency=('Frequency', 'median'),
-                Median_Monetary=('Monetary', 'median'),
-                Total_Rev=('Monetary', 'sum')
-            ).reset_index()
-
-            total_mon = seg_profile['Total_Rev'].sum()
-            seg_profile['% Revenue'] = (seg_profile['Total_Rev'] / total_mon * 100).round(2).astype(str) + '%'
-            seg_profile['Total_Rev'] = seg_profile['Total_Rev'].map('£{:,.2f}'.format)
-            seg_profile['Median_Monetary'] = seg_profile['Median_Monetary'].map('£{:,.2f}'.format)
-
-            st.dataframe(seg_profile, width="stretch")
-
+            st.subheader("📖 Arti Tiap Segmen")
             st.markdown("""
             *   **Champions:** Pelanggan VIP Anda yang belanja sangat sering, bernominal besar, dan bertransaksi baru-baru ini.
             *   **Loyal:** Pelanggan andalan yang bertransaksi stabil dan rutin kembali belanja.
@@ -281,34 +326,69 @@ elif page == "🛒 Analisis Keranjang (MBA)":
         min_conf = st.sidebar.slider("Minimum Confidence:", 0.1, 1.0, 0.5, 0.05)
         min_lift = st.sidebar.slider("Minimum Lift (Kekuatan Hubungan):", 1.0, 30.0, 1.0, 0.5)
 
-        # Filter Aturan
-        df_rules_filtered = df_rules[
-            (df_rules['confidence'] >= min_conf) &
-            (df_rules['lift'] >= min_lift)
-        ]
+        # Jumlah invoice di balik support, confidence, dan lift.
+        # Apriori dihitung dari invoice pelanggan terdaftar (yang punya CustomerID).
+        n_invoice = df_sales.loc[df_sales['CustomerID'].notna(), 'InvoiceNo'].nunique()
+        rules_view = df_rules.copy()
+        rules_view['Invoice A+B'] = (rules_view['support'] * n_invoice).round().astype(int)
+        rules_view['Invoice A'] = (rules_view['Invoice A+B'] / rules_view['confidence']).round().astype(int)
+        rules_view['Invoice B'] = (rules_view['confidence'] / rules_view['lift'] * n_invoice).round().astype(int)
 
-        st.write(f"Ditemukan **{len(df_rules_filtered)}** aturan asosiasi kuat yang memenuhi kriteria filter Anda.")
+        kolom_tampil = ['antecedents', 'consequents', 'support', 'confidence', 'lift',
+                        'Invoice A+B', 'Invoice A', 'Invoice B']
+        konfigurasi_kolom = {
+            'antecedents': st.column_config.TextColumn('A · antecedents (JIKA membeli)', width=300),
+            'consequents': st.column_config.TextColumn('B · consequents (MAKA juga membeli)', width=300),
+            'support': st.column_config.NumberColumn('support', format='%.4f', width=80,
+                help='Invoice A+B ÷ total invoice'),
+            'confidence': st.column_config.NumberColumn('confidence', format='%.4f', width=95,
+                help='Invoice A+B ÷ Invoice A'),
+            'lift': st.column_config.NumberColumn('lift', format='%.2f', width=70,
+                help='confidence ÷ (Invoice B ÷ total invoice)'),
+            'Invoice A+B': st.column_config.NumberColumn('Invoice A+B', format='%,d', width=95,
+                help='Jumlah invoice yang memuat A dan B sekaligus'),
+            'Invoice A': st.column_config.NumberColumn('Invoice A', format='%,d', width=85,
+                help='Jumlah invoice yang memuat A'),
+            'Invoice B': st.column_config.NumberColumn('Invoice B', format='%,d', width=85,
+                help='Jumlah invoice yang memuat B'),
+        }
+
+        # Filter Aturan
+        df_rules_filtered = rules_view[
+            (rules_view['confidence'] >= min_conf) &
+            (rules_view['lift'] >= min_lift)
+        ].sort_values(by='lift', ascending=False)
+
+        st.write(f"Dihitung dari **{n_invoice:,}** invoice pelanggan terdaftar. "
+                 f"Ditemukan **{len(df_rules_filtered)}** aturan asosiasi kuat yang memenuhi kriteria filter Anda.")
 
         # Tampilkan tabel utama
         st.dataframe(
-            df_rules_filtered.sort_values(by='lift', ascending=False),
-            width="stretch"
+            df_rules_filtered[kolom_tampil],
+            width="stretch", hide_index=True, column_config=konfigurasi_kolom
+        )
+        st.caption(
+            f"Cara menghitung: support = Invoice A+B ÷ {n_invoice:,} · "
+            "confidence = Invoice A+B ÷ Invoice A · "
+            f"lift = confidence ÷ (Invoice B ÷ {n_invoice:,})"
         )
 
         st.markdown("--- ")
         st.subheader("🔍 Cari Rekomendasi Asosiasi per Produk Spesifik")
-        st.write("Pilih produk untuk melihat barang apa saja yang paling berpeluang dibeli bersama produk tersebut.")
+        st.write("Pilih produk untuk melihat barang apa saja yang paling berpeluang dibeli bersama produk tersebut. "
+                 "Daftar ini mengikuti filter confidence dan lift di sidebar.")
 
-        # List unik produk dari antecedents
-        all_antes = sorted(list(set(df_rules['antecedents'].tolist())))
-        selected_prod = st.selectbox("Pilih Produk Utama:", all_antes)
-
-        if selected_prod:
-            match_rules = df_rules[df_rules['antecedents'] == selected_prod].sort_values(by='lift', ascending=False)
-            if not match_rules.empty:
-                st.dataframe(match_rules, width="stretch")
-            else:
-                st.info("Tidak ditemukan aturan asosiasi spesifik untuk produk ini pada batas ambang minimum saat ini.")
+        # List unik produk dari antecedents pada aturan yang lolos filter
+        all_antes = sorted(df_rules_filtered['antecedents'].unique().tolist())
+        if not all_antes:
+            st.info("Tidak ada aturan yang lolos filter saat ini. Turunkan Minimum Confidence atau Minimum Lift di sidebar.")
+        else:
+            selected_prod = st.selectbox("Pilih Produk Utama:", all_antes)
+            match_rules = df_rules_filtered[df_rules_filtered['antecedents'] == selected_prod]
+            st.dataframe(
+                match_rules[kolom_tampil],
+                width="stretch", hide_index=True, column_config=konfigurasi_kolom
+            )
 
 # ==========================================
 # 4. HALAMAN REKOMENDASI PRODUK (CF, CB, HYBRID)
@@ -321,7 +401,14 @@ elif page == "🎁 Rekomendasi Produk":
         st.warning("Data rekomendasi produk tidak ditemukan.")
     else:
         all_unique_prods = sorted(df_rec_prod['Produk'].unique().tolist())
-        selected_prod = st.selectbox("Pilih Nama Produk yang Ingin Direferensikan:", all_unique_prods)
+        buyers, invoices_per_prod = load_product_stats(df_sales)
+
+        # Default: produk yang paling sering dibeli (jumlah invoice terbanyak)
+        kandidat = invoices_per_prod[invoices_per_prod.index.isin(all_unique_prods)]
+        default_prod = kandidat.idxmax() if not kandidat.empty else all_unique_prods[0]
+        selected_prod = st.selectbox("Pilih Nama Produk yang Ingin Direferensikan:", all_unique_prods,
+                                     index=all_unique_prods.index(default_prod))
+        st.caption(f"Pilihan awal: {default_prod}, produk yang paling sering dibeli. Ketik sebagian nama untuk mencari produk lain.")
 
         if selected_prod:
             prod_df = df_rec_prod[df_rec_prod['Produk'] == selected_prod]
@@ -355,6 +442,36 @@ elif page == "🎁 Rekomendasi Produk":
                 else:
                     st.info("Rekomendasi Hybrid kosong.")
 
+            st.caption("Skor hanya bisa dibandingkan di dalam kolom yang sama; skala skor ketiga metode berbeda.")
+
+            # Rincian hitungan skor CF: berapa pelanggan membeli kedua produk
+            if not cf_df.empty and selected_prod in buyers:
+                with st.expander("🔎 Lihat hitungan skor Collaborative Filtering (jumlah pembeli)"):
+                    pembeli_terpilih = buyers[selected_prod]
+                    rincian = cf_df[['Rank', 'Rekomendasi', 'Skor']].copy()
+                    rincian['Pembeli Keduanya'] = rincian['Rekomendasi'].map(
+                        lambda p: len(pembeli_terpilih & buyers.get(p, frozenset())))
+                    rincian['Pembeli Produk Ini'] = rincian['Rekomendasi'].map(lambda p: len(buyers.get(p, frozenset())))
+                    st.write(f"**{selected_prod}** dibeli oleh **{len(pembeli_terpilih):,}** pelanggan terdaftar.")
+                    st.dataframe(
+                        rincian[['Rank', 'Rekomendasi', 'Pembeli Keduanya', 'Pembeli Produk Ini', 'Skor']],
+                        width="stretch", hide_index=True,
+                        column_config={
+                            'Pembeli Keduanya': st.column_config.NumberColumn(
+                                'Pembeli Keduanya', format='%,d',
+                                help='Jumlah pelanggan yang membeli produk terpilih dan produk rekomendasi'),
+                            'Pembeli Produk Ini': st.column_config.NumberColumn(
+                                'Pembeli Produk Rekomendasi', format='%,d'),
+                            'Skor': st.column_config.NumberColumn('Skor CF', format='%.4f'),
+                        }
+                    )
+                    contoh = rincian.iloc[0]
+                    st.caption(
+                        "Skor CF = Pembeli Keduanya ÷ √(pembeli produk terpilih × pembeli produk rekomendasi). "
+                        f"Contoh peringkat 1: {contoh['Pembeli Keduanya']:,} ÷ √({len(pembeli_terpilih):,} × "
+                        f"{contoh['Pembeli Produk Ini']:,}) = {contoh['Skor']:.4f}"
+                    )
+
 # ==========================================
 # 5. HALAMAN PREDIKSI CHURN PELANGGAN
 # ==========================================
@@ -387,6 +504,9 @@ elif page == "🔮 Prediksi Churn Pelanggan":
             cust_rec_df = df_rec_cust[df_rec_cust['CustomerID'] == selected_cust].sort_values(by='Rank')
             if not cust_rec_df.empty:
                 st.dataframe(cust_rec_df[['Rank', 'Rekomendasi', 'Skor']], width="stretch", hide_index=True)
+                st.caption("Skor = jumlah kemiripan (cosine similarity) dari 10 pelanggan dengan pola belanja paling mirip "
+                           "yang membeli produk tersebut. Maksimum 10, bukan persen; makin tinggi, makin banyak pelanggan "
+                           "serupa yang membelinya.")
             else:
                 st.info("Tidak ada riwayat rekomendasi personal untuk pelanggan ini.")
 
@@ -434,10 +554,26 @@ elif page == "🔮 Prediksi Churn Pelanggan":
         mon_80_pct = df_churn['Monetary'].quantile(0.80)
         val_risk_customers = df_churn[df_churn['Monetary'] >= mon_80_pct].sort_values(by='Churn_Prob', ascending=False).head(20)
 
+        tabel_prioritas = val_risk_customers[['CustomerID', 'Segment', 'Monetary', 'Recency', 'Frequency', 'Churn_Prob']].copy()
+        tabel_prioritas['Churn_Prob'] = tabel_prioritas['Churn_Prob'] * 100
         st.dataframe(
-            val_risk_customers[['CustomerID', 'Segment', 'Monetary', 'Recency', 'Frequency', 'Churn_Prob']],
-            width="stretch", hide_index=True
+            tabel_prioritas, width="stretch", hide_index=True,
+            column_config={
+                'CustomerID': st.column_config.NumberColumn('CustomerID', format='%d'),
+                'Segment': st.column_config.TextColumn('Segmen RFM'),
+                'Monetary': st.column_config.NumberColumn('Total Belanja (£)', format='%,.2f'),
+                'Recency': st.column_config.NumberColumn('Hari Sejak Belanja Terakhir', format='%d'),
+                'Frequency': st.column_config.NumberColumn('Jumlah Transaksi', format='%d'),
+                'Churn_Prob': st.column_config.NumberColumn('Probabilitas Churn', format='%.2f%%'),
+            }
         )
+        st.caption(f"Batas pelanggan bernilai tinggi: total belanja minimal £{mon_80_pct:,.2f} (persentil ke-80). "
+                   "Diurutkan dari probabilitas churn tertinggi.")
+        # Catatan kualitas data: order yang dibatalkan lewat koreksi manual masih terhitung
+        if (15098 in val_risk_customers['CustomerID'].values
+                and (df_sales['InvoiceNo'].astype(str) == '556444').any()):
+            st.caption("Catatan data: total belanja CustomerID 15098 termasuk order £38,970 (invoice 556444) yang "
+                       "dibatalkan lewat koreksi manual; belanja bersihnya hanya £649.50.")
 
 # ==========================================
 # 6. HALAMAN FORECAST PENDAPATAN
