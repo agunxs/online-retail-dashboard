@@ -126,6 +126,7 @@ if page == "📈 Ringkasan Penjualan":
                 markers=True, labels={'TotalPrice': 'Total Pendapatan (£)', 'InvoiceMonth': 'Bulan'}
             )
             st.plotly_chart(fig_trend, width="stretch")
+            st.caption("Catatan: data Desember 2011 hanya sampai 9 Desember, sehingga pendapatannya tampak turun tajam.")
 
         with col2:
             # Top 10 Produk
@@ -139,6 +140,63 @@ if page == "📈 Ringkasan Penjualan":
             )
             fig_prod.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_prod, width="stretch")
+
+        # Konsentrasi Penjualan per Negara
+        st.subheader("🌍 Konsentrasi Penjualan per Negara")
+        total_semua_negara = df_sales['TotalPrice'].sum()
+        uk_share = df_sales.loc[df_sales['Country'] == 'United Kingdom', 'TotalPrice'].sum() / total_semua_negara * 100
+        st.write(
+            f"United Kingdom menyumbang **{uk_share:.2f}%** dari total pendapatan semua negara. "
+            "Karena itu grafik menampilkan 10 negara teratas di luar UK agar perbedaannya terlihat. "
+            "Tabel di sebelah kanan memuat semua negara; klik judul kolom untuk mengurutkan."
+        )
+
+        country_stats = filtered_sales.groupby('Country').agg(
+            Pendapatan=('TotalPrice', 'sum'),
+            Invoice=('InvoiceNo', 'nunique'),
+            Pelanggan=('CustomerID', 'nunique')
+        )
+        country_stats['Median_Order'] = (
+            filtered_sales.groupby(['Country', 'InvoiceNo'])['TotalPrice'].sum()
+            .groupby(level='Country').median()
+        )
+        # Persentase selalu dihitung terhadap total semua negara (tidak ikut filter)
+        country_stats['Persen_Pendapatan'] = country_stats['Pendapatan'] / total_semua_negara * 100
+        country_stats = country_stats.sort_values(by='Pendapatan', ascending=False).reset_index()
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            top_non_uk = country_stats[country_stats['Country'] != 'United Kingdom'].head(10)
+            if top_non_uk.empty:
+                st.info("Hanya United Kingdom yang dipilih, jadi grafik negara di luar UK tidak ditampilkan.")
+            else:
+                top_non_uk = top_non_uk.assign(Label=top_non_uk['Persen_Pendapatan'].map('{:.2f}%'.format))
+                fig_country = px.bar(
+                    top_non_uk, x='Pendapatan', y='Country', orientation='h', text='Label',
+                    title="10 Negara Teratas di Luar UK (GBP £)",
+                    labels={'Pendapatan': 'Total Pendapatan (£)', 'Country': 'Negara',
+                            'Median_Order': 'Median Order (£)', 'Persen_Pendapatan': '% Pendapatan'},
+                    hover_data={'Pendapatan': ':,.2f', 'Pelanggan': True, 'Invoice': True,
+                                'Median_Order': ':,.2f', 'Persen_Pendapatan': ':.2f', 'Label': False}
+                )
+                fig_country.update_layout(yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_country, width="stretch")
+
+        with col4:
+            st.dataframe(
+                country_stats,
+                hide_index=True, width="stretch",
+                column_order=['Country', 'Pendapatan', 'Persen_Pendapatan', 'Pelanggan', 'Median_Order', 'Invoice'],
+                column_config={
+                    'Country': st.column_config.TextColumn('Negara'),
+                    'Pendapatan': st.column_config.NumberColumn('Pendapatan (£)', format='%,.2f'),
+                    'Persen_Pendapatan': st.column_config.NumberColumn('% Pendapatan', format='%.2f%%'),
+                    'Pelanggan': st.column_config.NumberColumn('Pelanggan', format='%,d'),
+                    'Median_Order': st.column_config.NumberColumn('Median Order (£)', format='%,.2f'),
+                    'Invoice': st.column_config.NumberColumn('Invoice', format='%,d'),
+                }
+            )
 
         # Heatmap Hari x Jam
         st.subheader("🗓️ Kepadatan Transaksi: Hari vs Jam")
